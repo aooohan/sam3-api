@@ -13,6 +13,7 @@ from sam3_image_service.config import Settings
 class FakeBackend:
     def __init__(self, *, should_fail: bool = False) -> None:
         self.should_fail = should_fail
+        self.prepare_calls = 0
 
     def describe(self) -> dict[str, object]:
         return {
@@ -23,6 +24,10 @@ class FakeBackend:
             "checkpoint_path": None,
             "message": None,
         }
+
+    def prepare(self) -> None:
+        self.prepare_calls += 1
+        return None
 
     def ensure_loaded(self) -> None:
         return None
@@ -126,3 +131,18 @@ def test_recognize_rejects_invalid_image_upload() -> None:
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Uploaded file is not a valid image."
+
+
+def test_app_triggers_prepare_on_startup() -> None:
+    backend = FakeBackend()
+    settings = Settings(
+        APP_HOST="127.0.0.1",
+        APP_PORT=8000,
+        SAM3_DOWNLOAD_ON_STARTUP=True,
+    )
+    app = create_app(settings=settings, backend=backend)
+
+    with TestClient(app):
+        pass
+
+    assert backend.prepare_calls == 1

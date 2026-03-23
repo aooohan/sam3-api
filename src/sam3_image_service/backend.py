@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib.util import find_spec
-from typing import Any, Protocol
+from pathlib import Path
+from typing import Any, Callable, Protocol
 
 import numpy as np
 from PIL import Image
@@ -37,6 +38,9 @@ class InferenceBackend(Protocol):
     def describe(self) -> dict[str, Any]:
         ...
 
+    def prepare(self) -> None:
+        ...
+
     def ensure_loaded(self) -> None:
         ...
 
@@ -52,30 +56,167 @@ class InferenceBackend(Protocol):
         ...
 
 
-class Sam3ModelBackend:
-    def __init__(self, settings: Settings) -> None:
+DownloadFile = Callable[..., str]
+
+
+def _hf_download_file(**kwargs: Any) -> str:
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(**kwargs)
+
+
+class LocalCheckpointResolver:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        download_file: DownloadFile | None = None,
+    ) -> None:
         self._settings = settings
+        self._download_file = download_file or _hf_download_file
+
+    @property
+    def expected_checkpoint_path(self) -> Path:
+        if self._settings.sam3_checkpoint_path:
+            return Path(self._settings.sam3_checkpoint_path).expanduser().resolve()
+        return (
+            Path(self._settings.sam3_model_dir).expanduser().resolve()
+            / self._settings.sam3_checkpoint_filename
+        )
+
+    def cached_checkpoint_path(self) -> Path | None:
+        checkpoint_path = self.expected_checkpoint_path
+        if checkpoint_path.exists():
+            return checkpoint_path
+        return None
+
+    def resolve(self, *, download_if_missing: bool) -> Path:
+        checkpoint_path = self.expected_checkpoint_path
+        if self._settings.sam3_checkpoint_path:
+            if checkpoint_path.exists():
+                return checkpoint_path
+            raise Sam3BackendError(
+                f"SAM3 checkpoint path does not exist: {checkpoint_path}. "
+                "Set SAM3_CHECKPOINT_PATH to a valid file."
+            )
+
+        if checkpoint_path.exists() and not self._settings.sam3_force_download:
+            return checkpoint_path
+
+        if not download_if_missing or not self._settings.sam3_load_from_hf:
+            raise Sam3BackendError(
+                "SAM3 checkpoint is not available locally. "
+                "Set SAM3_CHECKPOINT_PATH or enable SAM3_LOAD_FROM_HF."
+            )
+
+        model_dir = checkpoint_path.parent
+        model_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            self._download_file(
+                repo_id=self._settings.sam3_hf_model_id,
+                filename="config.json",
+                local_dir=model_dir,
+                token=self._settings.sam3_hf_token,
+                endpoint=self._settings.sam3_hf_endpoint,
+                force_download=self._settings.sam3_force_download,
+                local_files_only=self._settings.sam3_local_files_only,
+            )
+            self._download_file(
+                repo_id=self._settings.sam3_hf_model_id,
+                filename=self._settings.sam3_checkpoint_filename,
+                local_dir=model_dir,
+                token=self._settings.sam3_hf_token,
+                endpoint=self._settings.sam3_hf_endpoint,
+                force_download=self._settings.sam3_force_download,
+                local_files_only=self._settings.sam3_local_files_only,
+            )
+        except ImportError as exc:
+            raise Sam3BackendError(
+                "huggingface_hub is not available. Run `uv sync --extra runtime` first."
+            ) from exc
+        except Exception as exc:
+            raise Sam3BackendError(
+                "Failed to download SAM3 model files from the configured Hugging Face "
+                f"endpoint `{self._settings.sam3_hf_endpoint}`. Make sure this machine "
+                f"has access to the gated `{self._settings.sam3_hf_model_id}` repository, "
+                "then set `HF_TOKEN` or run `hf auth login`."
+            ) from exc
+
+        if checkpoint_path.exists():
+            return checkpoint_path
+
+        raise Sam3BackendError(
+            f"SAM3 files were downloaded but `{checkpoint_path.name}` was not found in "
+            f"{checkpoint_path.parent}."
+        )
+
+
+class Sam3ModelBackend:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        checkpoint_resolver: LocalCheckpointResolver | None = None,
+    ) -> None:
+        self._settings = settings
+        self._checkpoint_resolver = checkpoint_resolver or LocalCheckpointResolver(settings)
         self._processor: Any | None = None
         self._device: str | None = None
+        self._checkpoint_path: str | None = None
+        self._last_error: str | None = None
 
     def describe(self) -> dict[str, Any]:
         deps_available = (
             find_spec("sam3") is not None
             and find_spec("torch") is not None
             and find_spec("psutil") is not None
+            and find_spec("huggingface_hub") is not None
         )
-        message = None
+        checkpoint_path = self._checkpoint_path
+        cached_checkpoint = self._checkpoint_resolver.cached_checkpoint_path()
+        if checkpoint_path is None and cached_checkpoint is not None:
+            checkpoint_path = str(cached_checkpoint)
+
+        message = self._last_error
         if not deps_available:
             message = "SAM3 runtime dependencies are missing. Run `uv sync --extra runtime`."
+        elif (
+            message is None
+            and checkpoint_path is None
+            and not self._settings.sam3_load_from_hf
+            and self._settings.sam3_checkpoint_path is None
+        ):
+            message = (
+                "SAM3 checkpoint is not available locally. Set SAM3_CHECKPOINT_PATH or "
+                "enable SAM3_LOAD_FROM_HF."
+            )
+        elif message is None and checkpoint_path is None and self._settings.sam3_load_from_hf:
+            message = (
+                "SAM3 checkpoint is not cached yet. It will be downloaded into "
+                f"{self._checkpoint_resolver.expected_checkpoint_path.parent}."
+            )
+
+        status = "ok" if deps_available and message is None else "degraded"
 
         return {
-            "status": "ok" if deps_available else "degraded",
+            "status": status,
             "model_loaded": self._processor is not None,
             "runtime_dependencies_available": deps_available,
             "device": self._device,
-            "checkpoint_path": self._settings.sam3_checkpoint_path,
+            "checkpoint_path": checkpoint_path,
             "message": message,
         }
+
+    def prepare(self) -> None:
+        try:
+            checkpoint_path = self._checkpoint_resolver.resolve(download_if_missing=True)
+        except Sam3BackendError as exc:
+            self._last_error = str(exc)
+            raise
+
+        self._checkpoint_path = str(checkpoint_path)
+        self._last_error = None
 
     def ensure_loaded(self) -> None:
         if self._processor is not None:
@@ -92,28 +233,34 @@ class Sam3ModelBackend:
             ) from exc
 
         device = self._resolve_device(torch)
-        checkpoint_path = self._settings.sam3_checkpoint_path
+        try:
+            checkpoint_path = self._checkpoint_resolver.resolve(download_if_missing=True)
+        except Sam3BackendError as exc:
+            self._last_error = str(exc)
+            raise
+
+        self._checkpoint_path = str(checkpoint_path)
 
         builder_kwargs: dict[str, Any] = {
             "device": device,
             "compile": self._settings.sam3_enable_compile,
+            "checkpoint_path": str(checkpoint_path),
+            "load_from_HF": False,
         }
-        if checkpoint_path:
-            builder_kwargs["checkpoint_path"] = checkpoint_path
-        else:
-            builder_kwargs["load_from_HF"] = self._settings.sam3_load_from_hf
 
         try:
             model = build_sam3_image_model(**builder_kwargs)
         except TypeError:
             # Be tolerant of minor API differences across sam3 releases.
-            fallback_kwargs = {"device": device}
-            if checkpoint_path:
-                fallback_kwargs["checkpoint_path"] = checkpoint_path
+            fallback_kwargs = {
+                "device": device,
+                "checkpoint_path": str(checkpoint_path),
+            }
             model = build_sam3_image_model(**fallback_kwargs)
 
         self._processor = Sam3Processor(model)
         self._device = device
+        self._last_error = None
 
     def recognize(
         self,

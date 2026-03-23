@@ -34,6 +34,12 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        if settings.sam3_download_on_startup:
+            try:
+                app.state.backend.prepare()
+            except Sam3BackendError:
+                # The health endpoint will surface the reason if the runtime is not ready.
+                pass
         if settings.sam3_warmup_on_startup:
             try:
                 app.state.backend.ensure_loaded()
